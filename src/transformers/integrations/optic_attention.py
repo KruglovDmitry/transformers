@@ -2,16 +2,16 @@ from typing import Optional
 
 import torch
 
-from ..modeling_flash_attention_utils import _flash_attention_forward, flash_attn_supports_top_left_mask
+from ..modeling_optic_attention_utils import _optic_attention_forward, optic_attn_supports_top_left_mask
 from ..utils import logging
 
 
 logger = logging.get_logger(__name__)
 
-_use_top_left_mask = flash_attn_supports_top_left_mask()
+_use_top_left_mask = optic_attn_supports_top_left_mask()
 
 
-def flash_attention_forward(
+def optic_attention_forward(
     module: torch.nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -73,7 +73,7 @@ def flash_attention_forward(
     if is_causal is None:
         is_causal = module.is_causal
 
-    attn_output = _flash_attention_forward(
+    attn_output = _optic_attention_forward(
         query,
         key,
         value,
@@ -90,5 +90,5 @@ def flash_attention_forward(
         layer_idx=module.layer_idx if hasattr(module, "layer_idx") else None,
         **kwargs,
     )
-
+    
     return attn_output, None

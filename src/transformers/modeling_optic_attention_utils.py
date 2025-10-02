@@ -32,7 +32,7 @@ logger = logging.get_logger(__name__)
 
 
 # TODO Deprecate when all models have the attention interface
-def flash_attn_supports_top_left_mask():
+def optic_attn_supports_top_left_mask():
     if is_flash_attn_3_available():
         return False
     if is_flash_attn_2_available():
@@ -49,8 +49,8 @@ def is_flash_attn_available():
 
 
 # `globals()` is not compatible with dynamo, hence we have do define them in global scope ourselves
-_flash_fn = None
-_flash_varlen_fn = None
+_optic_fn = None
+_optic_varlen_fn = None
 _pad_fn = None
 _unpad_fn = None
 
@@ -79,7 +79,11 @@ def _lazy_imports(implementation: Optional[str]):
 
     pad_input, unpad_input = _pad_input, _unpad_input
 
-    if (implementation == "flash_attention_2" and is_fa2) or (implementation is None and is_fa2 and not is_fa3):
+    if (implementation == "optic_attention"):
+        from flash_attn import optic_attn_func as flash_attn_func
+        from flash_attn import optic_attn_varlen_func as flash_attn_varlen_func
+        from flash_attn.bert_padding import pad_input, unpad_input
+    elif (implementation == "flash_attention_2" and is_fa2) or (implementation is None and is_fa2 and not is_fa3):
         from flash_attn import flash_attn_func, flash_attn_varlen_func
         from flash_attn.bert_padding import pad_input, unpad_input
     elif is_torch_npu_available():
@@ -124,22 +128,22 @@ def _lazy_define_process_function(flash_function):
     return partial(_process_flash_attention_kwargs, supports_mapping=supports_mapping)
 
 
-def lazy_import_flash_attention(implementation: Optional[str]):
+def lazy_import_optic_attention(implementation: Optional[str]):
     """
     Lazily import flash attention and return the respective functions + flags.
 
     NOTE: For fullgraph, this needs to be called before compile, while no fullgraph can
     work without preloading. See `load_and_register_kernel` in `integrations.hub_kernels`.
     """
-    global _flash_fn, _flash_varlen_fn, _pad_fn, _unpad_fn
-    if any(k is None for k in [_flash_fn, _flash_varlen_fn, _pad_fn, _unpad_fn]):
-        _flash_fn, _flash_varlen_fn, _pad_fn, _unpad_fn = _lazy_imports(implementation)
+    global _optic_fn, _optic_varlen_fn, _pad_fn, _unpad_fn
+    if any(k is None for k in [_optic_fn, _optic_varlen_fn, _pad_fn, _unpad_fn]):
+        _optic_fn, _optic_varlen_fn, _pad_fn, _unpad_fn = _lazy_imports(implementation)
 
     global _process_flash_kwargs_fn
     if _process_flash_kwargs_fn is None:
-        _process_flash_kwargs_fn = _lazy_define_process_function(_flash_varlen_fn)
+        _process_flash_kwargs_fn = _lazy_define_process_function(_optic_varlen_fn)
 
-    return (_flash_fn, _flash_varlen_fn, _pad_fn, _unpad_fn), _process_flash_kwargs_fn
+    return (_optic_fn, _optic_varlen_fn, _pad_fn, _unpad_fn), _process_flash_kwargs_fn
 
 
 def _index_first_axis(tensor, indices):
@@ -526,7 +530,7 @@ def _process_flash_attention_kwargs(
     return flash_kwargs
 
 
-def _flash_attention_forward(
+def _optic_attention_forward(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
     value_states: torch.Tensor,
@@ -567,7 +571,7 @@ def _flash_attention_forward(
         implementation (`str`, *optional*):
             The attention implementation to use. If None, will default to the one based on the environment.
     """
-    (flash_fn, flash_varlen_fn, pad_fn, unpad_fn), process_flash_kwargs_fn = lazy_import_flash_attention(
+    (optic_fn, optic_varlen_fn, pad_fn, unpad_fn), process_flash_kwargs_fn = lazy_import_optic_attention(
         attn_implementation
     )
 
@@ -589,7 +593,7 @@ def _flash_attention_forward(
         deterministic=deterministic,
         **kwargs,
     )
-
+    
     # We will use `flash_varlen_fn` to prevent cross-example attention and also allow padding free approach under two cases:
     # Case 1. If position ids is provided and the position ids indicate packed sequences, see `_is_packed_sequence`.
     # Case 2. Some models pass directly pre-computed `cu_seqlens` so we don't need to infer it from position ids. It is safe to
@@ -613,7 +617,7 @@ def _flash_attention_forward(
         if "mps" in str(q.device):
             cu_seq_lens_k = cu_seq_lens_k.clone()
 
-        out_unpad = flash_varlen_fn(
+        out_unpad = optic_varlen_fn(
             q,
             k,
             v,
@@ -644,7 +648,7 @@ def _flash_attention_forward(
         if "mps" in str(q.device):
             cu_seq_lens_k = cu_seq_lens_k.clone()
 
-        out = flash_varlen_fn(
+        out = optic_varlen_fn(
             q,
             k,
             v,
@@ -661,7 +665,7 @@ def _flash_attention_forward(
 
     # No padding
     else:
-        out = flash_fn(query_states, key_states, value_states, **flash_kwargs)
+        out = optic_fn(query_states, key_states, value_states, **flash_kwargs)
         if isinstance(out, tuple):
             out = out[0]
 

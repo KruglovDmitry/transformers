@@ -53,6 +53,7 @@ from .integrations.accelerate import find_tied_parameters, init_empty_weights
 from .integrations.deepspeed import _load_state_dict_into_zero3_model
 from .integrations.eager_paged import eager_paged_attention_forward
 from .integrations.flash_attention import flash_attention_forward
+from .integrations.optic_attention import optic_attention_forward
 from .integrations.flash_paged import paged_attention_forward
 from .integrations.flex_attention import flex_attention_forward
 from .integrations.hub_kernels import is_kernel, load_and_register_kernel
@@ -6117,6 +6118,7 @@ class AttentionInterface(GeneralInterface):
         "sdpa": sdpa_attention_forward,
         "sdpa_paged": sdpa_attention_paged_forward,
         "eager_paged": eager_paged_attention_forward,
+        "optic_attention": optic_attention_forward
     }
 
 
