@@ -1,14 +1,13 @@
 from typing import Optional
 
 import torch
+import torch.nn as nn
 
 from ..modeling_optic_attention_utils import _optic_attention_forward, optic_attn_supports_top_left_mask
 from ..utils import logging
 
-
-logger = logging.get_logger(__name__)
-
 _use_top_left_mask = optic_attn_supports_top_left_mask()
+logger = logging.get_logger(__name__)
 
 
 def optic_attention_forward(

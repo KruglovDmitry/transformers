@@ -49,6 +49,11 @@ from ...utils.deprecation import deprecate_kwarg
 from ...utils.model_parallel_utils import assert_device_map, get_device_map
 from .configuration_gpt2 import GPT2Config
 
+import sys 
+sys.path.insert(1, r'/wd/Optical_matrix_multiplication')
+
+import source
+from source import propagator
 
 logger = logging.get_logger(__name__)
 
@@ -95,6 +100,63 @@ def eager_attention_forward(module, query, key, value, attention_mask, head_mask
 
     return attn_output, attn_weights
 
+def optic_attention_forward(module, query, key, value, attention_mask, head_mask=None, **kwargs):
+    head_size = query.size(3)
+
+    # First optic multiplication
+    attn_weights = module.optics_matmul_shift(module.sim_wei, query, key.transpose(-1, -2))
+    if not module.k_wei_is_initialized:
+        _attn_weights = query.detach() @ key.transpose(-1, -2).detach()
+        module.k_wei.data = torch.max(_attn_weights) / torch.max(attn_weights)
+        module.k_wei_is_initialized = True
+    attn_weights = attn_weights * module.k_wei * (head_size ** -0.5) 
+
+    if module.scale_attn_weights:
+        attn_weights = attn_weights / torch.full(
+            [], value.size(-1) ** 0.5, dtype=attn_weights.dtype, device=attn_weights.device
+        )
+
+    # Layer-wise attention scaling
+    if module.scale_attn_by_inverse_layer_idx:
+        attn_weights = attn_weights / float(module.layer_idx + 1)
+
+    if not module.is_cross_attention:
+        # if only "normal" attention layer implements causal mask
+        query_length, key_length = query.size(-2), key.size(-2)
+        causal_mask = module.bias[:, :, key_length - query_length : key_length, :key_length]
+        mask_value = torch.finfo(attn_weights.dtype).min
+        # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
+        # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
+        mask_value = torch.full([], mask_value, dtype=attn_weights.dtype, device=attn_weights.device)
+        attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
+
+    if attention_mask is not None:
+        # Apply the attention mask
+        causal_mask = attention_mask[:, :, :, : key.shape[-2]]
+        attn_weights = attn_weights + causal_mask
+
+    # Softmax
+    attn_weights = nn.functional.softmax(attn_weights, dim=2)   
+
+    # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
+    attn_weights = attn_weights.type(value.dtype)
+    attn_weights = module.attn_dropout(attn_weights)
+
+    # Mask heads if we want to
+    if head_mask is not None:
+        attn_weights = attn_weights * head_mask
+
+    # Second optic multiplication
+    attn_output = module.optics_matmul_shift(module.sim_out, attn_weights, value)
+    if not module.k_out_is_initialized:
+        _attn_output = attn_weights.detach() @ value.detach()
+        module.k_out.data = torch.max(_attn_output) / torch.max(attn_output)
+        module.k_out_is_initialized = True
+
+    attn_output = attn_output * module.k_out
+    attn_output = attn_output.transpose(1, 2)
+
+    return attn_output, attn_weights
 
 class GPT2Attention(nn.Module):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
@@ -140,6 +202,40 @@ class GPT2Attention(nn.Module):
         self.is_causal = True
 
         self.pruned_heads = set()
+
+        ### OPTICA ###
+        pixel_size = 3.6e-6
+        config_wei = source.Config(right_matrix_count_columns = 64,
+                right_matrix_count_rows = 64,
+                right_matrix_width = pixel_size * 64,
+                right_matrix_height = pixel_size * 64,
+                min_height_gap = pixel_size,
+                right_matrix_split_x = 2,
+                right_matrix_split_y = 2,
+                left_matrix_split_x = 2,
+                left_matrix_split_y = 2,
+                result_matrix_split = 2,
+                distance = 0.01)
+
+        config_out = source.Config(right_matrix_count_columns = 64,
+                right_matrix_count_rows = 64,
+                right_matrix_width = pixel_size * 64,
+                right_matrix_height = pixel_size * 64,
+                min_height_gap = pixel_size,
+                right_matrix_split_x = 2,
+                right_matrix_split_y = 2,
+                left_matrix_split_x = 2,
+                left_matrix_split_y = 2,
+                result_matrix_split = 2,
+                distance = 0.01)
+        
+        self.k_wei_is_initialized = False
+        self.k_wei = nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        self.k_out_is_initialized = False
+        self.k_out = nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        self.optica_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.sim_wei = source.DataParallel(source.OpticalMul(config_wei), output_device = self.optica_device)
+        self.sim_out = source.DataParallel(source.OpticalMul(config_out), output_device = self.optica_device)
 
     def prune_heads(self, heads):
         if len(heads) == 0:
@@ -208,6 +304,59 @@ class GPT2Attention(nn.Module):
         attn_output = attn_output.transpose(1, 2)
 
         return attn_output, attn_weights
+
+    def norm(self, matrix: torch.Tensor, max_val: float = 1) -> torch.Tensor:
+        """
+        Нормирует матрицу в [0, 1].
+        """
+        eps = 1e-10  # Для избежания деления на 0
+        return matrix / (max_val + eps)
+
+    def optics_matmul_shift(self, sim, tensor_1, tensor_2):
+        """
+        Функция умножения произвольных матриц на симуляторе оптической системы методом сдвига.
+
+        Поля:
+            sim:   симулятор
+            tensor_1: первая матрица.
+            tensor_2: вторая матрица.
+
+        Описание:
+            Так как симулятор лишен возможности работать с матрицами часть значений
+            которых находится в отрицательном диапазоне представим наше умножение как:
+            A x B = C => (A + Ash - Ash) x (B + Bsh - Bsh) = C (1)
+            Где Ash и Bsh неотрицательные матрицы постоянных значений при добавлении 
+            которых к исходным тензорам они полностью выводят их в положительный диапазон значений.
+            Тогда если: Ap = A + Ash и Bp = B + Bsh - не отрицательные матрицы, можно переписать (1):
+            (Ap - Ash) X (Bp - Bsh) = C
+            Или же учитывая свойство дистрибутивности:
+            Ap X Bp - Ap X Bsh - Ash X Bp + Ash X Bsh = C =>
+            (A + Ash) X (B + Bsh) - (A + Ash) X Bsh - Ash X (B + Bsh) + Ash X Bsh = C (2)
+            Дополнительно тензоры третьего порядка дополняться до 4. 
+        """
+        if torch.min(tensor_1) >= 0 and torch.min(tensor_2) >= 0:
+            max_abs = abs(max(torch.max(tensor_1), torch.max(tensor_2)))
+            a, b =  self.norm(tensor_1, max_abs), self.norm(tensor_2, max_abs)
+            return sim(a, b)
+
+        min_abs = abs(min(torch.min(tensor_1), torch.min(tensor_2)))
+        max_abs = abs(max(torch.max(tensor_1), torch.max(tensor_2))) + min_abs
+
+        shift_a = min_abs * torch.ones(tensor_1.shape).to(self.optica_device)
+        shift_b = min_abs * torch.ones(tensor_2.shape).to(self.optica_device)
+        a_a_sh = tensor_1 + shift_a
+        b_b_sh = tensor_2 + shift_b
+
+        a_a_sh_norm, b_b_sh_norm = self.norm(a_a_sh, max_abs), self.norm(b_b_sh, max_abs)
+        shift_a_norm, shift_b_norm = self.norm(shift_a, max_abs), self.norm(shift_b, max_abs) 
+
+        a_a_sh_b_b_sh = sim(a_a_sh_norm, b_b_sh_norm)
+        a_a_sh_b_sh = sim(a_a_sh_norm, shift_b_norm)
+        a_sh_b_b_sh = sim(shift_a_norm, b_b_sh_norm)
+        a_sh_b_sh = sim(shift_a_norm, shift_b_norm)
+
+        return (a_a_sh_b_b_sh - a_a_sh_b_sh - a_sh_b_b_sh + a_sh_b_sh)
+
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
@@ -279,6 +428,9 @@ class GPT2Attention(nn.Module):
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        if self.config._attn_implementation == "optic_attention":
+            attention_interface = optic_attention_forward
 
         if using_eager and self.reorder_and_upcast_attn:
             attn_output, attn_weights = self._upcast_and_reordered_attn(
